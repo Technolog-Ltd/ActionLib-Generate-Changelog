@@ -1,0 +1,265 @@
+name: Generate Changelog
+description: "Build CHANGELOG.md from log files for VERSION file(s)."
+
+inputs:
+  pr_number:
+    description: "Pull request number used to discover affected VERSION files."
+    required: false
+  github_token:
+    description: "GitHub token for API access (defaults to GITHUB_TOKEN)."
+    required: false
+  version_file:
+    description: "Preferred VERSION file path (optional)."
+    required: false
+  release_version:
+    description: "Deprecated. Version is derived from log files."
+    required: false
+  source_range:
+    description: "Log range: all, latest, or a starting version (e.g., 1.2.3)."
+    required: false
+    default: "all"
+  push_changes:
+    description: "Push commit to remote (default true)."
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Ensure GitHub CLI is authenticated
+      shell: bash
+      run: |
+        set -e
+        if [ -n "${{ inputs.github_token }}" ]; then
+          export GH_TOKEN="${{ inputs.github_token }}"
+        elif [ -z "${GH_TOKEN:-}" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+          export GH_TOKEN="$GITHUB_TOKEN"
+        fi
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "Missing GH_TOKEN/GITHUB_TOKEN for GitHub CLI."
+          exit 1
+        fi
+        gh auth status || gh auth login --with-token <<< "$GH_TOKEN"
+
+    - name: Generate changelog
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        repo="${GITHUB_REPOSITORY}"
+        pr_number="${{ inputs.pr_number }}"
+        source_range="${{ inputs.source_range }}"
+        if [ -z "$source_range" ]; then
+          source_range="all"
+        fi
+
+        if [ -z "$pr_number" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+          pr_number=$(jq -r '.pull_request.number // .workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")
+          if [ -z "$pr_number" ]; then
+            sha=$(jq -r '.workflow_run.head_sha // .after // empty' "$GITHUB_EVENT_PATH")
+            if [ -n "$sha" ]; then
+              pr_number=$(gh api "repos/${repo}/commits/${sha}/pulls" --jq '.[0].number')
+            fi
+          fi
+        fi
+
+        changed_files=()
+        relevant_files=()
+        if [ -n "$pr_number" ]; then
+          mapfile -t changed_files < <(gh api "repos/${repo}/pulls/${pr_number}/files" --paginate --jq '.[].filename')
+          for file in "${changed_files[@]}"; do
+            [ -z "$file" ] && continue
+            lower=$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')
+            if [[ "$lower" == .github/* ]]; then
+              continue
+            fi
+            if [[ "$lower" == *.md ]]; then
+              continue
+            fi
+            relevant_files+=("$file")
+          done
+        fi
+
+        preferred_version_file="${{ inputs.version_file }}"
+        version_files=()
+
+        if [ -n "$preferred_version_file" ]; then
+          if [ -f "$preferred_version_file" ]; then
+            version_files+=("$preferred_version_file")
+          else
+            echo "Preferred version file '$preferred_version_file' not found; falling back to discovery."
+          fi
+        fi
+
+        if [ "${#version_files[@]}" -eq 0 ]; then
+          if [ -f "VERSION" ]; then
+            version_files=("VERSION")
+          elif [ -n "$pr_number" ]; then
+            if [ "${#relevant_files[@]}" -eq 0 ]; then
+              echo "Only .github/* or *.md changes detected; skipping changelog update."
+              exit 0
+            fi
+            for file in "${relevant_files[@]}"; do
+              dir=$(dirname "$file")
+              while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+                if [ -f "$dir/VERSION" ]; then
+                  version_files+=("$dir/VERSION")
+                fi
+                dir=$(dirname "$dir")
+              done
+            done
+          else
+            echo "No VERSION file at repo root and no pr_number provided."
+            exit 1
+          fi
+        fi
+
+        if [ "${#version_files[@]}" -eq 0 ]; then
+          echo "No VERSION files found for changelog generation."
+          exit 1
+        fi
+
+        mapfile -t version_files < <(printf '%s\n' "${version_files[@]}" | awk 'NF' | sort -u)
+
+        base_dirs=()
+        for version_file in "${version_files[@]}"; do
+          base_dirs+=("$(dirname "$version_file")")
+        done
+        mapfile -t base_dirs < <(printf '%s\n' "${base_dirs[@]}" | awk 'NF' | sort -u)
+
+        repo_name="${GITHUB_REPOSITORY#*/}"
+        repo_title="${repo_name//-/ }"
+        repo_title="${repo_title//_/ }"
+
+        BASE_DIRS=$(printf '%s\n' "${base_dirs[@]}")
+        export BASE_DIRS
+        export SOURCE_RANGE="$source_range"
+        export REPO_TITLE="$repo_title"
+
+        python - <<'PY'
+        import os
+        import re
+        from pathlib import Path
+
+        def parse_version(value):
+            cleaned = value.strip()
+            if cleaned.lower().startswith("v"):
+                cleaned = cleaned[1:]
+            if not re.match(r"^\d+\.\d+\.\d+$", cleaned):
+                return None
+            return tuple(int(part) for part in cleaned.split("."))
+
+        source_range = os.environ.get("SOURCE_RANGE", "all").strip().lower()
+        repo_title = os.environ.get("REPO_TITLE", "").strip()
+        base_dirs_raw = os.environ.get("BASE_DIRS", "")
+        base_dirs = [Path(line) for line in base_dirs_raw.splitlines() if line.strip()]
+
+        for base_dir in base_dirs:
+            logs_dir = base_dir / "logs"
+            entries = []
+            if logs_dir.is_dir():
+                for log_path in logs_dir.glob("*.md"):
+                    version_str = log_path.stem
+                    version = parse_version(version_str)
+                    if version is None:
+                        continue
+                    entries.append((version, version_str, log_path))
+
+            entries.sort(key=lambda item: item[0], reverse=True)
+
+            if source_range == "all":
+                filtered = entries
+            elif source_range == "latest":
+                if entries:
+                    latest_major = entries[0][0][0]
+                    filtered = [entry for entry in entries if entry[0][0] == latest_major]
+                else:
+                    filtered = []
+            else:
+                start_version = parse_version(source_range)
+                if start_version is None:
+                    raise SystemExit(
+                        f"Invalid source_range '{source_range}'. Use all, latest, or a version like 1.2.3."
+                    )
+                filtered = [entry for entry in entries if entry[0] >= start_version]
+
+            if base_dir == Path("."):
+                header = f"# **{repo_title}** | Changelog"
+            else:
+                feature_name = base_dir.name.replace("-", " ").replace("_", " ")
+                header = f"# **{repo_title}** | {feature_name} | Changelog"
+
+            lines = [
+                header,
+                "",
+                "| [Home](./README.md)",
+                "| **Changelog**",
+                "| [Contributing](./CONTRIBUTING.md)",
+                "| [Tech Doc](./techdoc.md)",
+                "| <!-- End Of Menu -->",
+                "",
+                "---",
+                "",
+            ]
+
+            for _, _, log_path in filtered:
+                content = log_path.read_text(encoding="utf-8").rstrip()
+                if content:
+                    lines.append(content)
+                    lines.append("")
+
+            changelog_path = base_dir / "CHANGELOG.md"
+            changelog_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        PY
+
+        paths_to_add=()
+        for base_dir in "${base_dirs[@]}"; do
+          if [ "$base_dir" = "." ]; then
+            changelog_path="CHANGELOG.md"
+            logs_dir="logs"
+          else
+            changelog_path="$base_dir/CHANGELOG.md"
+            logs_dir="$base_dir/logs"
+          fi
+
+          if [ -d "$logs_dir" ]; then
+            paths_to_add+=("$logs_dir")
+          fi
+          if [ -f "$changelog_path" ]; then
+            paths_to_add+=("$changelog_path")
+          fi
+        done
+
+        if [ "${#paths_to_add[@]}" -eq 0 ]; then
+          echo "No changelog artifacts to add."
+          exit 0
+        fi
+
+        git add "${paths_to_add[@]}"
+
+        if git diff --cached --quiet; then
+          echo "No changelog updates to commit."
+        else
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "ci: update changelog"
+        fi
+
+        branch="${GITHUB_REF_NAME:-}"
+        if [ -z "$branch" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
+          branch=$(jq -r '.workflow_run.head_branch // .ref // empty' "$GITHUB_EVENT_PATH")
+          branch="${branch#refs/heads/}"
+        fi
+
+        push_changes="${{ inputs.push_changes }}"
+        push_changes_lower=$(printf '%s' "$push_changes" | tr '[:upper:]' '[:lower:]')
+        if [ "$push_changes_lower" = "false" ]; then
+          echo "Skipping push (push_changes=false)."
+          exit 0
+        fi
+
+        if [ -n "$branch" ]; then
+          git push origin "HEAD:${branch}"
+        else
+          git push
+        fi
