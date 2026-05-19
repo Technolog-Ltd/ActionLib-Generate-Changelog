@@ -51,5 +51,5 @@ environments = {
 }
 
 import_resources = {
-  repository = "ActionLibrary-Generate-Changelog"
+  repository = "ActionLib-Generate-Changelog"
 }
